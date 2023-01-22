@@ -50,6 +50,13 @@ typedef struct {
     Direction nextMovement; // if backward of currentMovement, ignore
     Point fruit;
     GameState state;
+
+    FuriMutex** mutex;
+    FuriMessageQueue* event_queue;
+    ViewPort* view_port;
+    Gui* gui;
+    FuriTimer* timer;
+    NotificationApp* notification;
 } SnakeState;
 
 typedef enum {
@@ -92,10 +99,8 @@ const NotificationSequence sequence_eat = {
 };
 
 static void snake_game_render_callback(Canvas* const canvas, void* ctx) {
-    const SnakeState* snake_state = acquire_mutex((ValueMutex*)ctx, 25);
-    if(snake_state == NULL) {
-        return;
-    }
+    SnakeState* snake_state = ctx;
+    furi_check(furi_mutex_acquire(snake_state->mutex, FuriWaitForever) == FuriStatusOk);
 
     // Before the function is called, the state is set with the canvas_reset(canvas)
 
@@ -118,6 +123,7 @@ static void snake_game_render_callback(Canvas* const canvas, void* ctx) {
 
     // Game Over banner
     if(snake_state->state == GameStateGameOver) {
+
         // Screen is 128x64 px
         canvas_set_color(canvas, ColorWhite);
         canvas_draw_box(canvas, 34, 20, 62, 24);
@@ -134,7 +140,7 @@ static void snake_game_render_callback(Canvas* const canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 41, AlignCenter, AlignBottom, buffer);
     }
 
-    release_mutex((ValueMutex*)ctx, snake_state);
+    furi_mutex_release(snake_state->mutex);
 }
 
 static void snake_game_input_callback(InputEvent* input_event, FuriMessageQueue* event_queue) {
@@ -151,23 +157,33 @@ static void snake_game_update_timer_callback(FuriMessageQueue* event_queue) {
     furi_message_queue_put(event_queue, &event, 0);
 }
 
-static void snake_game_init_game(SnakeState* const snake_state) {
+static void snake_game_init_snake(SnakeState* const snake_state) {
     Point p[] = {{8, 6}, {7, 6}, {6, 6}, {5, 6}, {4, 6}, {3, 6}, {2, 6}};
     memcpy(snake_state->points, p, sizeof(p)); //-V1086
-
     snake_state->len = 7;
-
     snake_state->currentMovement = DirectionRight;
-
     snake_state->nextMovement = DirectionRight;
-
     Point f = {18, 6};
     snake_state->fruit = f;
-
     snake_state->state = GameStateLife;
 }
 
+static void snake_game_init_game(SnakeState* const snake_state) {
+    snake_state->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    snake_state->event_queue = furi_message_queue_alloc(8, sizeof(SnakeEvent));
+    snake_state->timer = furi_timer_alloc(snake_game_update_timer_callback, FuriTimerTypePeriodic, snake_state->event_queue);
+    snake_state->view_port = view_port_alloc();
+    snake_state->gui = furi_record_open("gui");
+    snake_state->notification = furi_record_open(RECORD_NOTIFICATION);
+
+    furi_timer_start(snake_state->timer, furi_kernel_get_tick_frequency() / 4);
+    view_port_draw_callback_set(snake_state->view_port, snake_game_render_callback, snake_state);
+    view_port_input_callback_set(snake_state->view_port, snake_game_input_callback, snake_state->event_queue);
+    gui_add_view_port(snake_state->gui, snake_state->view_port, GuiLayerFullscreen);
+}
+
 static Point snake_game_get_new_fruit(SnakeState const* const snake_state) {
+
     // 1 bit for each point on the playing field where the snake can turn
     // and where the fruit can appear
     uint16_t buffer[8];
@@ -186,8 +202,8 @@ static Point snake_game_get_new_fruit(SnakeState const* const snake_state) {
         buffer[p.y] |= 1 << p.x;
         empty--;
     }
-    // Bit set if snake use that playing field
 
+    // Bit set if snake use that playing field
     uint16_t newFruit = rand() % empty;
 
     // Skip random number of _empty_ fields
@@ -211,6 +227,7 @@ static Point snake_game_get_new_fruit(SnakeState const* const snake_state) {
 }
 
 static bool snake_game_collision_with_frame(Point const next_step) {
+
     // if x == 0 && currentMovement == left then x - 1 == 255 ,
     // so check only x > right border
     return next_step.x > 30 || next_step.y > 14;
@@ -229,6 +246,7 @@ static bool
 }
 
 static Direction snake_game_get_turn_snake(SnakeState const* const snake_state) {
+
     // Sum of two `Direction` lies between 0 and 6, odd values indicate orthogonality.
     bool is_orthogonal = (snake_state->currentMovement + snake_state->nextMovement) % 2 == 1;
     return is_orthogonal ? snake_state->nextMovement : snake_state->currentMovement;
@@ -253,6 +271,8 @@ static Point snake_game_get_next_step(SnakeState const* const snake_state) {
     case DirectionLeft:
         next_step.x--;
         break;
+    default:
+        break;
     }
     return next_step;
 }
@@ -269,7 +289,6 @@ static void
     }
 
     snake_state->currentMovement = snake_game_get_turn_snake(snake_state);
-
     Point next_step = snake_game_get_next_step(snake_state);
 
     bool crush = snake_game_collision_with_frame(next_step);
@@ -313,46 +332,38 @@ static void
     }
 }
 
+void snake_game_free(SnakeState* snake_state) {
+
+    // Wait for all notifications to be played and return backlight to normal state
+    notification_message_block(snake_state->notification, &sequence_display_backlight_enforce_auto);
+
+    furi_timer_free(snake_state->timer);
+    view_port_enabled_set(snake_state->view_port, false);
+    gui_remove_view_port(snake_state->gui, snake_state->view_port);
+    furi_record_close(RECORD_GUI);
+    furi_record_close(RECORD_NOTIFICATION);
+    view_port_free(snake_state->view_port);
+    furi_message_queue_free(snake_state->event_queue);
+    furi_mutex_free(snake_state->mutex);
+    free(snake_state->points);
+    free(snake_state);
+}
+
+
 int32_t snake_game_app(void* p) {
     UNUSED(p);
 
-    FuriMessageQueue* event_queue = furi_message_queue_alloc(8, sizeof(SnakeEvent));
-
     SnakeState* snake_state = malloc(sizeof(SnakeState));
+    snake_game_init_snake(snake_state);
     snake_game_init_game(snake_state);
-
-    ValueMutex state_mutex;
-    if(!init_mutex(&state_mutex, snake_state, sizeof(SnakeState))) {
-        FURI_LOG_E("SnakeGame", "cannot create mutex\r\n");
-        furi_message_queue_free(event_queue);
-        free(snake_state);
-        return 255;
-    }
-
-    ViewPort* view_port = view_port_alloc();
-    view_port_draw_callback_set(view_port, snake_game_render_callback, &state_mutex);
-    view_port_input_callback_set(view_port, snake_game_input_callback, event_queue);
-
-    FuriTimer* timer =
-        furi_timer_alloc(snake_game_update_timer_callback, FuriTimerTypePeriodic, event_queue);
-    furi_timer_start(timer, furi_kernel_get_tick_frequency() / 4);
-
-    // Open GUI and register view_port
-    Gui* gui = furi_record_open(RECORD_GUI);
-    gui_add_view_port(gui, view_port, GuiLayerFullscreen);
-    NotificationApp* notification = furi_record_open(RECORD_NOTIFICATION);
-
-    notification_message_block(notification, &sequence_display_backlight_enforce_on);
 
     DOLPHIN_DEED(DolphinDeedPluginGameStart);
 
     SnakeEvent event;
     for(bool processing = true; processing;) {
-        FuriStatus event_status = furi_message_queue_get(event_queue, &event, 100);
+        if(furi_message_queue_get(snake_state->event_queue, &event, 100) == FuriStatusOk) {
+            furi_check(furi_mutex_acquire(snake_state->mutex, FuriWaitForever) == FuriStatusOk);
 
-        SnakeState* snake_state = (SnakeState*)acquire_mutex_block(&state_mutex);
-
-        if(event_status == FuriStatusOk) {
             // press events
             if(event.type == EventTypeKey) {
                 if(event.input.type == InputTypePress) {
@@ -371,7 +382,7 @@ int32_t snake_game_app(void* p) {
                         break;
                     case InputKeyOk:
                         if(snake_state->state == GameStateGameOver) {
-                            snake_game_init_game(snake_state);
+                            snake_game_init_snake(snake_state);
                         }
                         break;
                     case InputKeyBack:
@@ -382,28 +393,17 @@ int32_t snake_game_app(void* p) {
                     }
                 }
             } else if(event.type == EventTypeTick) {
-                snake_game_process_game_step(snake_state, notification);
+                snake_game_process_game_step(snake_state, snake_state->notification);
             }
         } else {
-            // event timeout
+             //event timeout
         }
 
-        view_port_update(view_port);
-        release_mutex(&state_mutex, snake_state);
+        view_port_update(snake_state->view_port);
+        furi_mutex_release(snake_state->mutex);
     }
 
-    // Wait for all notifications to be played and return backlight to normal state
-    notification_message_block(notification, &sequence_display_backlight_enforce_auto);
-
-    furi_timer_free(timer);
-    view_port_enabled_set(view_port, false);
-    gui_remove_view_port(gui, view_port);
-    furi_record_close(RECORD_GUI);
-    furi_record_close(RECORD_NOTIFICATION);
-    view_port_free(view_port);
-    furi_message_queue_free(event_queue);
-    delete_mutex(&state_mutex);
-    free(snake_state);
+    snake_game_free(snake_state);
 
     return 0;
 }
